@@ -42,6 +42,7 @@
 #include <stdio.h>
 #include <sys/mount.h>
 #include <unistd.h>
+#include <stdlib.h>
 
 
 SPANK_PLUGIN (spank_private_tmpshm, 1);
@@ -81,29 +82,37 @@ int _get_tmpshm (spank_t sp, char *tmpdir, char *shmdir) {
     return 0;
 }
 
-/* Create tmpdir and shmdir in prolog. */
-int slurm_spank_job_prolog (spank_t sp, int ac, char **av) {
-    uid_t uid = -1;
-    gid_t gid = -1;
+int get_uid_gid(spank_t sp, uid_t *uid, gid_t *gid) {
     struct passwd *pwd = NULL;
 
-    char tmpdir[PATH_MAX];
-    char shmdir[PATH_MAX];
-
     /* In prolog we can get uid but not gid. */
-    if (spank_get_item(sp, S_JOB_UID, &uid)) {
+    if (spank_get_item(sp, S_JOB_UID, uid)) {
         slurm_error("%s: Unable to get uid: %m", myname);
         return -1;
     }
 
     /* Get gid of the user. */
     errno = 0;
-    pwd = getpwuid(uid);
+    pwd = getpwuid(*uid);
     if (errno) {
         slurm_error("%s, Unable to get gid: %m", myname);
     }
 
-    gid = pwd->pw_gid;
+    *gid = pwd->pw_gid;
+
+    return 0;
+}
+
+/* Create tmpdir and shmdir in prolog. */
+int slurm_spank_job_prolog (spank_t sp, int ac, char **av) {
+    uid_t uid = -1;
+    gid_t gid = -1;
+    if (get_uid_gid(sp, &uid, &gid)) {
+        return -1;
+    }
+
+    char tmpdir[PATH_MAX];
+    char shmdir[PATH_MAX];
 
     /* Get private tmp and shm locations. */
     if (_get_tmpshm(sp, tmpdir, shmdir)) {
@@ -140,6 +149,12 @@ int slurm_spank_job_prolog (spank_t sp, int ac, char **av) {
  * namespace for each task before the priviledge is dropped. This callback
  * function is only executed in a remote context. */
 int slurm_spank_task_init_privileged (spank_t sp, int ac, char **av) {
+    uid_t uid = -1;
+    gid_t gid = -1;
+    if (get_uid_gid(sp, &uid, &gid)) {
+        return -1;
+    }
+
     char tmpdir[PATH_MAX];
     char shmdir[PATH_MAX];
 
@@ -148,6 +163,34 @@ int slurm_spank_task_init_privileged (spank_t sp, int ac, char **av) {
         slurm_error("%s: Unable to construct tmpdir or shmdir", myname);
         return -1;
     }
+
+    uint32_t local_tasks;
+    if (spank_get_item(sp, S_JOB_LOCAL_TASK_COUNT, &local_tasks)) {
+        slurm_error("%s: Unable to get local_task_count", myname);
+        return -1;
+    }
+
+    uint32_t total_tasks;
+    if (spank_get_item(sp, S_JOB_TOTAL_TASK_COUNT, &total_tasks)) {
+        slurm_error("%s: Unable to get local_task_count", myname);
+        return -1;
+    }
+
+    uint64_t job_memory;
+    if (spank_get_item(sp, S_JOB_ALLOC_MEM, &job_memory)) {
+        slurm_error("%s: Unable to get job_memory", myname);
+        return -1;
+    }
+
+    char* options = malloc(sizeof(char) * 128);
+    uint64_t local_mem = job_memory / total_tasks * local_tasks;
+    asprintf(&options, "size=%dM,uid=%d,gid=%d,mode=700", local_mem, uid, gid);
+    if (mount("tmpfs", shmdir, "tmpfs", 0, options)) {
+        slurm_error("%s: unable to mount tmpfs on %s with %s", myname, shmdir, options);
+        free(options);
+        return -1;
+    }
+    free(options);
 
     /* Make entire '/' mount tree shareable. */
     if (mount("", "/", "none", MS_REC|MS_SHARED, "")) {
@@ -196,6 +239,11 @@ int slurm_spank_job_epilog (spank_t sp, int ac, char **av) {
     /* Get private tmp and shm locations. */
     if (_get_tmpshm(sp, tmpdir, shmdir)) {
         slurm_error("%s: Unable to construct tmpdir or shmdir", myname);
+        return -1;
+    }
+
+    if (umount(shmdir)) {
+        slurm_error("%s: Unable to unmount %s", myname, shmdir);
         return -1;
     }
 
